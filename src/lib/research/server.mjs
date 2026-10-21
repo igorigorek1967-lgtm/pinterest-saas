@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import path from 'node:path';
@@ -39,9 +39,16 @@ export function validSession(token, secret, now = Math.floor(Date.now()/1000)) {
   if (!/^[A-Za-z0-9_-]{43}$/.test(signature) || !timingSafeEqual(Buffer.from(signature),Buffer.from(expected))) return false;
   try { const data=JSON.parse(Buffer.from(body,'base64url').toString());return Number.isInteger(data.iat)&&Number.isInteger(data.exp)&&data.iat<=now&&data.exp>now&&data.exp-data.iat===LIFETIME&&typeof data.nonce==='string'; } catch {return false;}
 }
-export function sessionFromCookie(cookie, secret) {
+export function sessionFromCookie(cookie, secret, hash, db=database()) {
   const token=(cookie||'').split(';').map(v=>v.trim()).find(v=>v.startsWith(COOKIE+'='))?.slice(COOKIE.length+1);
-  return validSession(token,secret);
+  if (!validSession(token,secret)) return false;
+  const row=db.prepare('SELECT credential, expires FROM sessions WHERE id=?').get(digest(token));
+  return !!row && row.expires>Date.now() && row.credential===digest(hash || '');
+}
+const digest = value => createHash('sha256').update(value).digest('hex');
+export function logout(cookie, db=database()) {
+  const token=(cookie||'').split(';').map(v=>v.trim()).find(v=>v.startsWith(COOKIE+'='))?.slice(COOKIE.length+1);
+  if(token)db.prepare('DELETE FROM sessions WHERE id=?').run(digest(token));
 }
 export function cookieValue(token, secure, logout=false) {
   return `${COOKIE}=${logout?'':token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${logout?0:LIFETIME}${secure?'; Secure':''}`;
@@ -54,13 +61,13 @@ export function sameOrigin(request, cfg=config()) {
 }
 export function requireOwner(request) {
   const cfg=config();
-  if (!sessionFromCookie(request.headers.get('cookie'),cfg.secret)) throw new ResearchError(401,'Войдите как владелец.');
+  if (!sessionFromCookie(request.headers.get('cookie'),cfg.secret,cfg.hash)) throw new ResearchError(401,'Войдите как владелец.');
   return cfg;
 }
-export async function bodyJson(request) {
+export async function bodyJson(request, limit=2_000_000) {
   const reader=request.body?.getReader();if(!reader)throw new ResearchError(400,'Пустой запрос.');
   const decoder=new TextDecoder();let body='',size=0;
-  for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>2_000_000){await reader.cancel();throw new ResearchError(413,'Запрос превышает 2 МБ.');}body+=decoder.decode(value,{stream:true});}
+  for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>limit){await reader.cancel();throw new ResearchError(413,'Запрос превышает допустимый размер.');}body+=decoder.decode(value,{stream:true});}
   body+=decoder.decode();
   try {const parsed=JSON.parse(body);if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw new Error();return parsed;}catch{throw new ResearchError(400,'Неверный JSON-запрос.');}
 }
@@ -74,6 +81,7 @@ export function database() {
     CREATE TABLE IF NOT EXISTS observations (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS briefs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS settings (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, credential TEXT NOT NULL, expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS login_failures (occurred INTEGER NOT NULL);`);
   databases.set(directory,db);return db;
 }
@@ -81,19 +89,19 @@ export function readState(db=database()) {
   const proxyRow=db.prepare('SELECT payload FROM settings WHERE id=?').get('proxy');
   return { observations:db.prepare('SELECT payload FROM observations ORDER BY rowid DESC').all().map(row=>JSON.parse(row.payload)), briefs:db.prepare('SELECT payload FROM briefs ORDER BY rowid DESC').all().map(row=>JSON.parse(row.payload)), proxy:proxyRow?JSON.parse(proxyRow.payload):{status:'unknown',checkedAt:null,expiresOn:null} };
 }
-export function importObservations(incoming, allowRelated=false, db=database()) {
-  if(!Array.isArray(incoming)||!incoming.length||incoming.length>5000)throw new ResearchError(400,'Нужно от 1 до 5000 наблюдений.');
+export function importObservations(incoming, allowRelated=false, db=database(), limit=5000, transaction=true) {
+  if(!Array.isArray(incoming)||!incoming.length||incoming.length>limit)throw new ResearchError(400,'Нужно от 1 до 5000 наблюдений.');
   let validated;try{validated=incoming.map(validateObservation);}catch(e){throw new ResearchError(400,e.message);}
   if(!allowRelated&&validated.some(row=>row.project==='geo-yeisk'&&!isYeiskQuery(row.keyword)))throw new ResearchError(400,'Есть темы без названия города. Проверьте и подтвердите смежные темы.');
-  db.exec('BEGIN IMMEDIATE');
+  if(transaction)db.exec('BEGIN IMMEDIATE');
   try {
     const existing=readState(db).observations;
     let merged;try{merged=mergeObservations(existing,validated);}catch(e){throw new ResearchError(409,e.message);}
     if(merged.rows.length>20000)throw new ResearchError(400,'Достигнут предел 20 000 наблюдений. Сохраните архив перед продолжением.');
     const insert=db.prepare('INSERT OR IGNORE INTO observations(id,payload) VALUES (?,?)');
     for(const row of validated)insert.run(observationId(row),JSON.stringify(row));
-    db.exec('COMMIT');return {added:merged.added,duplicates:merged.duplicates};
-  }catch(e){db.exec('ROLLBACK');throw e;}
+    if(transaction)db.exec('COMMIT');return {added:merged.added,duplicates:merged.duplicates};
+  }catch(e){if(transaction)db.exec('ROLLBACK');throw e;}
 }
 export function saveBrief(observation, db=database()) {
   let row;try{row=validateObservation(observation);}catch(e){throw new ResearchError(400,e.message);}
@@ -111,11 +119,37 @@ export function saveProxy(value, db=database()) {
   db.prepare('INSERT INTO settings(id,payload) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run('proxy',JSON.stringify(proxy));
   return {proxy,readiness:proxyReadiness(proxy)};
 }
+export const BACKUP_LIMIT = 200_000_000;
+export function exportBackup(db=database()) {
+  const {observations,briefs,proxy}=readState(db);
+  const indexes=new Map(observations.map((row,index)=>[observationId(row),index]));
+  return {schema:'pinterest-research.backup.v2',exportedAt:new Date().toISOString(),observations,briefObservationIndexes:briefs.map(brief=>indexes.get(brief.idempotencyKey)),proxy};
+}
+export function restoreBackup(input, db=database()) {
+  if(input?.schema!=='pinterest-research.backup.v2'||!Array.isArray(input.observations)||input.observations.length>20000||!Array.isArray(input.briefObservationIndexes)||input.briefObservationIndexes.length>20000)throw new ResearchError(400,'Неверный формат резервной копии.');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result=input.observations.length?importObservations(input.observations,true,db,20000,false):{added:0,duplicates:0};
+    for(const index of input.briefObservationIndexes){
+      if(!Number.isInteger(index)||index<0||index>=input.observations.length)throw new ResearchError(400,'Задание без наблюдения в резервной копии.');
+      saveBrief(input.observations[index],db);
+    }
+    saveProxy(input.proxy,db);
+    db.exec('COMMIT');return result;
+  }catch(error){db.exec('ROLLBACK');throw error;}
+}
 export function login(password, cfg=config(), db=database()) {
   const now=Date.now();db.prepare('DELETE FROM login_failures WHERE occurred < ?').run(now-600000);
-  if(db.prepare('SELECT COUNT(*) AS count FROM login_failures').get().count>=10)throw new ResearchError(429,'Слишком много попыток. Повторите через 10 минут.');
-  if(!passwordMatches(password,cfg.hash)){db.prepare('INSERT INTO login_failures(occurred) VALUES (?)').run(now);throw new ResearchError(401,'Неверный пароль.');}
-  db.exec('DELETE FROM login_failures');return signSession(cfg.secret);
+  if(!passwordMatches(password,cfg.hash)){
+    const limited=db.prepare('SELECT COUNT(*) AS count FROM login_failures').get().count>=10;
+    if(!limited)db.prepare('INSERT INTO login_failures(occurred) VALUES (?)').run(now);
+    throw new ResearchError(limited?429:401,limited?'Слишком много неверных попыток.':'Неверный пароль.');
+  }
+  db.exec('DELETE FROM login_failures');
+  db.prepare('DELETE FROM sessions WHERE expires <= ? OR credential != ?').run(now,digest(cfg.hash));
+  const token=signSession(cfg.secret);
+  db.prepare('INSERT INTO sessions(id,credential,expires) VALUES (?,?,?)').run(digest(token),digest(cfg.hash),now+LIFETIME*1000);
+  return token;
 }
 export async function queryPinmetrica(input, apiKey=process.env.PINMETRICA_API_KEY, factory=key=>new PinmetricaClient(key)) {
   if(!apiKey)throw new ResearchError(503,'Источник Pinmetrica ещё не подключён на сервере.');

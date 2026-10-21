@@ -9,3 +9,22 @@ test('сохраняет ID темы и тип числа из наблюдав�
 test('неизвестный формат не превращается в пустой результат',()=>assert.throws(()=>parseSearchResult({content:[{type:'text',text:'Новый формат'}]})));
 test('credential remains in fixed-origin header; client follows initialization sequence',async()=>{const calls=[];const client=new PinmetricaClient('pm_test_only',async(url,options)=>{assert.equal(url,ENDPOINT);assert.equal(options.redirect,'error');assert.equal(options.headers.Authorization,'Bearer pm_test_only');const request=JSON.parse(options.body);calls.push(request.method);if(request.method==='notifications/initialized')return new Response(null,{status:202});const result=request.method==='initialize'?{protocolVersion:'2024-11-05'}:{tools:[]};return Response.json({jsonrpc:'2.0',id:request.id,result});});assert.deepEqual(await client.listTools(),[]);assert.deepEqual(calls,['initialize','notifications/initialized','tools/list']);await assert.rejects(()=>client.call('delete_account',{}));});
 test('HTTP errors do not expose response bodies',async()=>{const client=new PinmetricaClient('pm_test_only',async()=>new Response('secret server diagnostic',{status:401}));await assert.rejects(()=>client.listTools(),error=>error.message==='Pinmetrica MCP: HTTP 401.');});
+
+test('unknown volume formats never silently change numeric values',()=>{
+  for(const value of ['1.5K','1 200','1,5','1,,200','1234,567','9007199254740992'])
+    assert.throws(()=>parseSearchResult({content:[{type:'text',text:`• Ейск — объём: ${value} | ID темы: \`123\``}]}),value);
+  for(const [value,expected] of [['0',0],['12',12],['1,200',1200],['—',null]])
+    assert.equal(parseSearchResult({content:[{type:'text',text:`• Ейск — объём: ${value} | ID темы: \`123\``}]} )[0].value,expected);
+});
+test('SSE completes on matching response while upstream stream remains open',async()=>{
+  let cancelled=false;
+  const client=new PinmetricaClient('pm_test_only',async(url,options)=>{
+    const request=JSON.parse(options.body);
+    if(request.method==='notifications/initialized')return new Response(null,{status:202});
+    if(request.method==='initialize')return Response.json({jsonrpc:'2.0',id:request.id,result:{protocolVersion:'2024-11-05'}});
+    const encoder=new TextEncoder();const data=`: heartbeat\n\ndata: ${JSON.stringify({jsonrpc:'2.0',method:'progress'})}\n\ndata: ${JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})}\n\n`;
+    return new Response(new ReadableStream({start(controller){const bytes=encoder.encode(data);controller.enqueue(bytes.slice(0,30));controller.enqueue(bytes.slice(30));},cancel(){cancelled=true;}}),{headers:{'Content-Type':'text/event-stream'}});
+  });
+  let timer;try{assert.deepEqual(await Promise.race([client.listTools(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('SSE did not finish')),1000);})]),[]);}finally{clearTimeout(timer);}
+  assert.equal(cancelled,true);
+});

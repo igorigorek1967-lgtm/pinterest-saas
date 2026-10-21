@@ -33,19 +33,32 @@ export class PinmetricaClient {
     if (notification) { await response.body?.cancel(); return; }
     const reader = response.body?.getReader();
     if (!reader) throw new Error('Пустой ответ MCP.');
-    const chunks = []; let length = 0;
+    const contentType = response.headers.get('Content-Type') || '';
+    const decoder = new TextDecoder(); let buffer = '', length = 0;
     try {
       for (;;) {
-        const {done, value} = await reader.read(); if (done) break;
+        const {done, value} = await reader.read();
+        if (done) break;
         length += value.byteLength;
         if (length > 2_000_000) throw new Error('Ответ MCP превышает 2 МБ.');
-        chunks.push(value);
+        buffer += decoder.decode(value, {stream:true});
+        if (contentType.includes('text/event-stream')) {
+          let boundary;
+          while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+            const event = buffer.slice(0,boundary.index);
+            buffer = buffer.slice(boundary.index+boundary[0].length);
+            const data = event.split(/\r?\n/).filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trimStart()).join('\n');
+            if (!data) continue;
+            const message = JSON.parse(data);
+            if (message?.id === id) return decodeRpc(JSON.stringify(message),'application/json',id);
+          }
+        }
       }
-    } catch (error) { await reader.cancel(); throw error; }
-    const bytes = new Uint8Array(length); let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-    return decodeRpc(new TextDecoder().decode(bytes), response.headers.get('Content-Type') || '', id);
+      buffer += decoder.decode();
+      return decodeRpc(buffer, contentType, id);
+    } finally { await reader.cancel().catch(()=>{}); }
   }
+
   async initialize() {
     const result = await this.#request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'pinterest-research-workbench', version: '0.1.0' } });
     if (result?.protocolVersion !== '2024-11-05') throw new Error('Версия протокола требует отдельной проверки.');
@@ -73,8 +86,9 @@ export function parseSearchResult(result) {
   if (!lines.length && !/не найден|нет результат|найдено 0/i.test(text)) throw new Error('Формат ответа поиска изменился. Импорт остановлен.');
   return lines.map(line => {
     const clean = line.replace(/\*\*/g, '');
-    const match = clean.match(/^• (.+?) — объём: ([\d,]+|—).*?ID темы: `(\d+)`/);
-    if (!match) throw new Error('Не удалось прочитать строку поиска.');
+    const match = clean.match(/^• (.+?) — объём: (—|[0-9][0-9,]*)(?=\s+(?:[📈📉]|\|)).*?ID темы: `(\d+)`/u);
+    if (!match || !/^(?:—|0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)$/.test(match[2])) throw new Error('Не удалось прочитать строку поиска.');
+    if (match[2] !== '—' && !Number.isSafeInteger(Number(match[2].replaceAll(',', '')))) throw new Error('Неверная частотность.');
     const trend = clean.match(/[📈📉]?\s([+-]\d+(?:\.\d+)?)%/u);
     return { keyword: match[1], topicId: match[3], value: match[2] === '—' ? null : Number(match[2].replaceAll(',', '')), trendPercent: trend ? Number(trend[1]) : null };
   });

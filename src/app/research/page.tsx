@@ -8,7 +8,7 @@ export default async function ResearchPage() {
   try {
     const cfg = config();
     const jar = await cookies();
-    if (sessionFromCookie(jar.toString(), cfg.secret)) return <Workbench/>;
+    if (sessionFromCookie(jar.toString(), cfg.secret, cfg.hash)) return <Workbench/>;
     return <Login configured/>;
   } catch { return <Login configured={false}/>; }
 }

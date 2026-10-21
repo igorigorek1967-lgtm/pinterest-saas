@@ -2,6 +2,8 @@ name: Research checks and REA audit
 on:
   pull_request:
     paths:
+      - 'Dockerfile'
+      - '.dockerignore'
       - 'src/**'
       - 'scripts/research/**'
       - 'tests/**'
@@ -23,6 +25,16 @@ jobs:
       - run: npm run build
         env:
           NEXT_TELEMETRY_DISABLED: '1'
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - run: docker build -t pinterest-research:test .
+      - run: node scripts/research/container-smoke.mjs
   rea:
     runs-on: ubuntu-latest
     timeout-minutes: 15
