@@ -2,6 +2,7 @@ name: Research checks and REA audit
 on:
   pull_request:
     paths:
+      - 'compose.research-pilot.yml'
       - 'Dockerfile'
       - '.dockerignore'
       - 'src/**'
@@ -21,6 +22,7 @@ jobs:
         with:
           node-version: '24.19.0'
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: python3 -m unittest discover -s tests -p 'test_preflight.py'
       - run: npm test
       - run: npm run build
         env:

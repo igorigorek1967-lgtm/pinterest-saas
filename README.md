@@ -22,6 +22,7 @@ npm run start
 Интерфейс — `/research`. Для размещения подготовлен Dockerfile.
 
 - [Серверная настройка и работа владельца](docs/research/SERVER.md)
+- [Закрытый пилот на OnDash](docs/research/PILOT.md)
 - [Проверки и оставшиеся ограничения](docs/research/VALIDATION.md)
 - [Выводы исследования](docs/research/FINDINGS.md)
 

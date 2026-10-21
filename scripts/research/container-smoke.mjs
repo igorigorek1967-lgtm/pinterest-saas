@@ -6,8 +6,12 @@ const name='research-ci-'+randomBytes(6).toString('hex');
 const volumes=[name+'-source',name+'-restore'];
 const password=randomBytes(24).toString('hex'),salt=randomBytes(16).toString('hex');
 const origin='http://127.0.0.1:3039';
-const env={...process.env,RESEARCH_OWNER_PASSWORD_HASH:`scrypt$${salt}$${scryptSync(password,salt,64).toString('hex')}`,RESEARCH_SESSION_SECRET:randomBytes(32).toString('hex'),RESEARCH_PUBLIC_ORIGIN:origin,RESEARCH_SECURE_COOKIES:'false'};
-const docker=(...args)=>execFileSync('docker',args,{env,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
+const env={...process.env,RESEARCH_OWNER_PASSWORD_HASH:`scrypt$${salt}$${scryptSync(password,salt,64).toString('hex')}`,RESEARCH_SESSION_SECRET:randomBytes(32).toString('hex'),RESEARCH_PUBLIC_ORIGIN:origin,RESEARCH_SECURE_COOKIES:'false',RESEARCH_PILOT_PORT:'3039'};
+const docker=(...args)=>{
+  const safeEnv={...env};for(const key of ['DOCKER_HOST','DOCKER_CONTEXT','DOCKER_TLS_VERIFY','DOCKER_CERT_PATH','DOCKER_API_VERSION'])delete safeEnv[key];
+  try{return execFileSync('docker',['--host','unix:///var/run/docker.sock',...args],{env:safeEnv,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();}
+  catch{throw new Error('Disposable Docker check failed: '+args[0]);}
+};
 let cookie='';
 async function request(action,body,auth=cookie,requestOrigin=origin){
   const response=await fetch(origin+'/api/research/'+action,{method:body===undefined?'GET':'POST',headers:{...(body===undefined?{}:{'Content-Type':'application/json',Origin:requestOrigin}),...(auth?{Cookie:auth}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});
@@ -22,6 +26,14 @@ async function start(volume){
   throw new Error('Container startup failed.');
 }
 try{
+  // Conflicting inherited settings must never select another daemon/project.
+  env.DOCKER_HOST='tcp://192.0.2.2:2375';env.DOCKER_CONTEXT='nonexistent-fixture';env.COMPOSE_PROJECT_NAME='other-project-fixture';
+  const compose=['compose','--env-file','/dev/null','-p','pinterest-research-pilot','-f','compose.research-pilot.yml'];
+  docker(...compose,'config','--quiet');
+  const planned=JSON.parse(docker(...compose,'config','--format','json'));
+  assert.equal(planned.name,'pinterest-research-pilot');
+  assert.equal(planned.services.research.ports[0].host_ip,'127.0.0.1');
+  assert.equal(planned.volumes.research_data.name,'pinterest-research-pilot_research_data');
   for(const volume of volumes)docker('volume','create',volume);
   await start(volumes[0]);
   assert.equal((await request('state',undefined,'')).response.status,401);

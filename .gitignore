@@ -46,3 +46,6 @@ next-init/
 # Private server storage and local research evidence
 var/
 research-evidence/
+
+# Python preflight checks
+__pycache__/

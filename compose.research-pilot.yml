@@ -1,0 +1,20 @@
+name: pinterest-research-pilot
+services:
+  research:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${RESEARCH_PILOT_PORT:?Select a verified unused port}:3000"
+    environment:
+      RESEARCH_OWNER_PASSWORD_HASH: "${RESEARCH_OWNER_PASSWORD_HASH:?Owner password hash required}"
+      RESEARCH_SESSION_SECRET: "${RESEARCH_SESSION_SECRET:?Session secret required}"
+      RESEARCH_PUBLIC_ORIGIN: "http://127.0.0.1:${RESEARCH_PILOT_PORT:?Select a verified unused port}"
+      RESEARCH_SECURE_COOKIES: "false"
+      RESEARCH_DATA_DIR: /app/var/research
+      PINMETRICA_API_KEY: "${PINMETRICA_API_KEY:-}"
+    volumes:
+      - research_data:/app/var/research
+volumes:
+  research_data:
