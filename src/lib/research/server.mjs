@@ -1,0 +1,151 @@
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdirSync, chmodSync } from 'node:fs';
+import path from 'node:path';
+import { validateObservation, mergeObservations, makeBrief, observationId, isYeiskQuery, proxyReadiness, PROJECTS } from './core.ts';
+import { PinmetricaClient, parseSearchResult } from '../../../scripts/research/mcp-client.mjs';
+
+const COOKIE = 'research_session';
+const LIFETIME = 12 * 60 * 60;
+const databases = new Map();
+export class ResearchError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+export function passwordHash(password, salt = randomBytes(16).toString('hex')) {
+  if (typeof password !== 'string' || password.length < 12 || password.length > 1024) throw new Error('Пароль: от 12 до 1024 символов.');
+  return `scrypt$${salt}$${scryptSync(password, salt, 64).toString('hex')}`;
+}
+export function passwordMatches(password, encoded) {
+  if (typeof password !== 'string' || password.length > 1024 || typeof encoded !== 'string') return false;
+  const match = encoded.match(/^scrypt\$([a-f0-9]{32})\$([a-f0-9]{128})$/);
+  if (!match) return false;
+  return timingSafeEqual(scryptSync(password, match[1], 64), Buffer.from(match[2], 'hex'));
+}
+export function config() {
+  const hash = process.env.RESEARCH_OWNER_PASSWORD_HASH || '';
+  const secret = process.env.RESEARCH_SESSION_SECRET || '';
+  if (!/^scrypt\$[a-f0-9]{32}\$[a-f0-9]{128}$/.test(hash) || secret.length < 32) throw new ResearchError(503, 'Вход владельца ещё не настроен на сервере.');
+  return { hash, secret, secure: process.env.RESEARCH_SECURE_COOKIES !== 'false', origin: process.env.RESEARCH_PUBLIC_ORIGIN || '' };
+}
+export function signSession(secret, now = Math.floor(Date.now()/1000)) {
+  const body = Buffer.from(JSON.stringify({iat:now,exp:now+LIFETIME,nonce:randomBytes(16).toString('hex')})).toString('base64url');
+  return body+'.'+createHmac('sha256',secret).update(body).digest('base64url');
+}
+export function validSession(token, secret, now = Math.floor(Date.now()/1000)) {
+  if (typeof token !== 'string' || token.length > 512) return false;
+  const [body, signature, extra] = token.split('.');
+  if (!body || !signature || extra) return false;
+  const expected = createHmac('sha256',secret).update(body).digest('base64url');
+  if (!/^[A-Za-z0-9_-]{43}$/.test(signature) || !timingSafeEqual(Buffer.from(signature),Buffer.from(expected))) return false;
+  try { const data=JSON.parse(Buffer.from(body,'base64url').toString());return Number.isInteger(data.iat)&&Number.isInteger(data.exp)&&data.iat<=now&&data.exp>now&&data.exp-data.iat===LIFETIME&&typeof data.nonce==='string'; } catch {return false;}
+}
+export function sessionFromCookie(cookie, secret) {
+  const token=(cookie||'').split(';').map(v=>v.trim()).find(v=>v.startsWith(COOKIE+'='))?.slice(COOKIE.length+1);
+  return validSession(token,secret);
+}
+export function cookieValue(token, secure, logout=false) {
+  return `${COOKIE}=${logout?'':token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${logout?0:LIFETIME}${secure?'; Secure':''}`;
+}
+export function sameOrigin(request, cfg=config()) {
+  const origin=request.headers.get('origin');
+  const allowed=cfg.origin || (process.env.NODE_ENV==='production' ? '' : new URL(request.url).origin);
+  if (!allowed || origin!==allowed) throw new ResearchError(403,'Запрос должен исходить из этого приложения.');
+  if (!request.headers.get('content-type')?.startsWith('application/json')) throw new ResearchError(415,'Нужен JSON-запрос.');
+}
+export function requireOwner(request) {
+  const cfg=config();
+  if (!sessionFromCookie(request.headers.get('cookie'),cfg.secret)) throw new ResearchError(401,'Войдите как владелец.');
+  return cfg;
+}
+export async function bodyJson(request) {
+  const reader=request.body?.getReader();if(!reader)throw new ResearchError(400,'Пустой запрос.');
+  const decoder=new TextDecoder();let body='',size=0;
+  for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>2_000_000){await reader.cancel();throw new ResearchError(413,'Запрос превышает 2 МБ.');}body+=decoder.decode(value,{stream:true});}
+  body+=decoder.decode();
+  try {const parsed=JSON.parse(body);if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw new Error();return parsed;}catch{throw new ResearchError(400,'Неверный JSON-запрос.');}
+}
+export function database() {
+  const directory=path.resolve(/* turbopackIgnore: true */ process.env.RESEARCH_DATA_DIR||'./var/research');
+  if(databases.has(directory))return databases.get(directory);
+  mkdirSync(directory,{recursive:true,mode:0o700});
+  const file=path.join(directory,'research.sqlite');
+  const db=new DatabaseSync(file);chmodSync(file,0o600);
+  db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+    CREATE TABLE IF NOT EXISTS observations (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS briefs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS settings (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS login_failures (occurred INTEGER NOT NULL);`);
+  databases.set(directory,db);return db;
+}
+export function readState(db=database()) {
+  const proxyRow=db.prepare('SELECT payload FROM settings WHERE id=?').get('proxy');
+  return { observations:db.prepare('SELECT payload FROM observations ORDER BY rowid DESC').all().map(row=>JSON.parse(row.payload)), briefs:db.prepare('SELECT payload FROM briefs ORDER BY rowid DESC').all().map(row=>JSON.parse(row.payload)), proxy:proxyRow?JSON.parse(proxyRow.payload):{status:'unknown',checkedAt:null,expiresOn:null} };
+}
+export function importObservations(incoming, allowRelated=false, db=database()) {
+  if(!Array.isArray(incoming)||!incoming.length||incoming.length>5000)throw new ResearchError(400,'Нужно от 1 до 5000 наблюдений.');
+  let validated;try{validated=incoming.map(validateObservation);}catch(e){throw new ResearchError(400,e.message);}
+  if(!allowRelated&&validated.some(row=>row.project==='geo-yeisk'&&!isYeiskQuery(row.keyword)))throw new ResearchError(400,'Есть темы без названия города. Проверьте и подтвердите смежные темы.');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const existing=readState(db).observations;
+    let merged;try{merged=mergeObservations(existing,validated);}catch(e){throw new ResearchError(409,e.message);}
+    if(merged.rows.length>20000)throw new ResearchError(400,'Достигнут предел 20 000 наблюдений. Сохраните архив перед продолжением.');
+    const insert=db.prepare('INSERT OR IGNORE INTO observations(id,payload) VALUES (?,?)');
+    for(const row of validated)insert.run(observationId(row),JSON.stringify(row));
+    db.exec('COMMIT');return {added:merged.added,duplicates:merged.duplicates};
+  }catch(e){db.exec('ROLLBACK');throw e;}
+}
+export function saveBrief(observation, db=database()) {
+  let row;try{row=validateObservation(observation);}catch(e){throw new ResearchError(400,e.message);}
+  const stored=db.prepare('SELECT payload FROM observations WHERE id=?').get(observationId(row));
+  if(!stored)throw new ResearchError(400,'Сначала сохраните наблюдение.');
+  const brief=makeBrief(JSON.parse(stored.payload));
+  const result=db.prepare('INSERT OR IGNORE INTO briefs(id,payload) VALUES (?,?)').run(brief.idempotencyKey,JSON.stringify(brief));
+  return {brief,created:result.changes>0};
+}
+export function saveProxy(value, db=database()) {
+  if(!value||!['unknown','working','failed'].includes(value.status))throw new ResearchError(400,'Неверный статус проверки прокси.');
+  const proxy={status:value.status,checkedAt:value.checkedAt||null,expiresOn:value.expiresOn||null};
+  if(proxy.checkedAt&&(typeof proxy.checkedAt!=='string'||!Number.isFinite(Date.parse(proxy.checkedAt))||Date.parse(proxy.checkedAt)>Date.now()))throw new ResearchError(400,'Неверное время проверки.');
+  if(proxy.expiresOn&&(typeof proxy.expiresOn!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(proxy.expiresOn)||!Number.isFinite(Date.parse(proxy.expiresOn))||new Date(proxy.expiresOn).toISOString().slice(0,10)!==proxy.expiresOn))throw new ResearchError(400,'Неверная дата окончания.');
+  db.prepare('INSERT INTO settings(id,payload) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run('proxy',JSON.stringify(proxy));
+  return {proxy,readiness:proxyReadiness(proxy)};
+}
+export function login(password, cfg=config(), db=database()) {
+  const now=Date.now();db.prepare('DELETE FROM login_failures WHERE occurred < ?').run(now-600000);
+  if(db.prepare('SELECT COUNT(*) AS count FROM login_failures').get().count>=10)throw new ResearchError(429,'Слишком много попыток. Повторите через 10 минут.');
+  if(!passwordMatches(password,cfg.hash)){db.prepare('INSERT INTO login_failures(occurred) VALUES (?)').run(now);throw new ResearchError(401,'Неверный пароль.');}
+  db.exec('DELETE FROM login_failures');return signSession(cfg.secret);
+}
+export async function queryPinmetrica(input, apiKey=process.env.PINMETRICA_API_KEY, factory=key=>new PinmetricaClient(key)) {
+  if(!apiKey)throw new ResearchError(503,'Источник Pinmetrica ещё не подключён на сервере.');
+  const mode=input.mode||'search';
+  if(!['search','suggest','categories','theme'].includes(mode))throw new ResearchError(400,'Неизвестный режим исследования.');
+  if(!PROJECTS.includes(input.project))throw new ResearchError(400,'Неизвестный проект.');
+  if(!['ru','en'].includes(input.language))throw new ResearchError(400,'Выберите язык результатов.');
+  let name,args;
+  if(mode==='categories'){name='get_categories';args={};}
+  else if(mode==='theme'){
+    if(typeof input.themeId!=='string'||!/^\d{1,30}$/.test(input.themeId))throw new ResearchError(400,'Нужен ID темы из поиска.');
+    name='get_theme';args={theme_id:input.themeId};
+  }else{
+    if(typeof input.q!=='string'||input.q.trim().length<(mode==='search'?2:1)||input.q.length>200)throw new ResearchError(400,'Проверьте поисковый запрос.');
+    if(mode==='search'){
+      const page=input.page??1;if(!Number.isInteger(page)||page<1||page>5)throw new ResearchError(400,'Страница: от 1 до 5.');
+      name='search_keywords';args={q:input.q.trim(),page,per_page:20};
+    }else{name='suggest_keywords';args={q:input.q.trim(),limit:20};}
+  }
+  try {
+    const client=factory(apiKey);const tools=await client.listTools();if(!tools.some(tool=>tool.name===name))throw new Error('Tool missing');
+    const result=await client.call(name,args);
+    const text=result.content.filter(item=>item.type==='text'&&typeof item.text==='string').map(item=>item.text).join('\n');
+    if(mode!=='search')return {mode,text,observations:[],excluded:[],tools:tools.map(t=>t.name)};
+    const candidates=parseSearchResult(result),observations=[],excluded=[];
+    for(const row of candidates){
+      if(input.project==='geo-yeisk'&&!isYeiskQuery(row.keyword)){excluded.push({keyword:row.keyword,reason:'Нет отдельного названия города. Требуется ручная проверка.'});continue;}
+      observations.push(validateObservation({...row,project:input.project,language:input.language,country:null,metric:'monthly_searches',source:'Pinmetrica MCP · search_keywords',sourceUrl:'https://api.pinmetrica.com/pinterest-api/mcp',observedAt:new Date().toISOString().slice(0,10)}));
+    }
+    return {mode,text,observations,excluded,tools:tools.map(t=>t.name),coverage:{page:args.page,pageSize:20,complete:false}};
+  }catch(e){if(e instanceof ResearchError)throw e;throw new ResearchError(502,'Источник не вернул проверяемый ответ. Повторите запрос позже или используйте импорт.');}
+}
+export function closeDatabases() {for(const db of databases.values())db.close();databases.clear();}

@@ -1,0 +1,48 @@
+name: Research checks and REA audit
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'scripts/research/**'
+      - 'tests/**'
+      - 'package*.json'
+      - '.github/workflows/research-checks.yml'
+permissions:
+  contents: read
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+  rea:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - name: Obtain the four public client assets observed in the research
+        run: |
+          mkdir -p "$RUNNER_TEMP/pinmetrica-target"
+          for asset in index-5LKJb_53.js proxies-CIH-dGwk.js parsing-BLs-HGgj.js mcp-Bs0UuHht.js; do
+            curl --fail --silent --show-error --max-time 30 "https://app.pinmetrica.com/assets/$asset" -o "$RUNNER_TEMP/pinmetrica-target/$asset"
+          done
+      - name: Run REA in an ordinary Linux process environment
+        run: bash scripts/research/rea-audit.sh "$RUNNER_TEMP/pinmetrica-target" "$RUNNER_TEMP/rea-evidence"
+      - name: Retain evidence, including any incomplete analysis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rea-evidence
+          path: ${{ runner.temp }}/rea-evidence
+          retention-days: 7
