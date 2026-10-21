@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { parseImport, validateObservation, mergeObservations, cluster, proxyReadiness, makeBrief } from '../src/lib/research/core.ts';
+
+const context = {project:'geo-yeisk',language:'ru',country:null,metric:'monthly_searches',source:'Тестовый источник',sourceUrl:'https://example.com/research',observedAt:'2026-10-20'};
+const row = (patch={}) => validateObservation({...context,keyword:'Аренда жилья в Ейске',value:12,...patch});
+test('нет данных отличается от нуля',()=>{assert.equal(row({value:null}).value,null);assert.equal(row({value:0}).value,0);});
+test('индекс 0–100 не заменяет абсолютную частотность',()=>{assert.throws(()=>row({metric:'relative_index',value:101}));assert.throws(()=>row({metric:'unmeasured',value:12}));});
+test('неверная строка отклоняет весь импорт',()=>assert.throws(()=>parseImport('[{"keyword":"Ейск","value":12},{"keyword":"Ейск","value":"нет"}]',context)));
+test('русский CSV: пробелы в числах, кавычки и точка с запятой',()=>{const rows=parseImport('Ключ;Объём;Тенденция\n"Ейск, жильё";"1 200";"+2,5%"',context);assert.equal(rows[0].value,1200);assert.equal(rows[0].trendPercent,2.5);});
+test('пустые числа не превращаются в ноль',()=>assert.equal(parseImport('keyword,value\nЕйск,—',context)[0].value,null));
+test('даты и секреты в ссылках не принимаются',()=>{assert.throws(()=>row({observedAt:'2026-02-30'}));assert.throws(()=>row({sourceUrl:'https://example.com/?key=secret'}));assert.throws(()=>row({sourceUrl:'javascript:alert(1)'}));});
+test('повторный импорт не создаёт дублей',()=>{const result=mergeObservations([row()], [row({keyword:' аренда жилья в ейске '})]);assert.equal(result.rows.length,1);assert.equal(result.duplicates,1);});
+test('разные ID тем и страны сохраняются отдельно',()=>assert.equal(mergeObservations([], [row({topicId:'1'}),row({topicId:'2'}),row({country:'US'})]).rows.length,3));
+test('изменение значения в том же наблюдении требует уточнения',()=>assert.throws(()=>mergeObservations([row()],[row({value:13})])));
+test('история по разным датам сохраняется',()=>assert.equal(mergeObservations([row()],[row({observedAt:'2026-10-19'})]).rows.length,2));
+test('группировка по намерению',()=>assert.equal(cluster('Снять квартиру в Ейске','geo-yeisk'),'Подбор жилья'));
+test('проверка прокси не бессрочная',()=>{assert.equal(proxyReadiness({status:'working',checkedAt:'2026-10-19T00:00:00Z',expiresOn:'2026-10-30'},new Date('2026-10-21')).state,'unknown');});
+test('просроченный прокси блокирует сбор, неизвестный срок не считается исправностью',()=>{const now=new Date('2026-10-21T12:00:00Z');assert.equal(proxyReadiness({status:'working',checkedAt:'2026-10-21T10:00:00Z',expiresOn:'2026-10-20'},now).state,'blocked');assert.equal(proxyReadiness({status:'working',checkedAt:'2026-10-21T10:00:00Z',expiresOn:null},now).state,'warning');});
+test('задание сохраняет доказательства и не заявляет отправку',()=>{const brief=makeBrief(row());assert.equal(brief.delivery,'NOT_SENT');assert.equal(brief.instructions.externalPublication,false);assert.equal(brief.evidence.value,12);});
