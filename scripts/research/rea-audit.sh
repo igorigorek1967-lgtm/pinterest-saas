@@ -16,5 +16,5 @@ if ! ps -axo pid=,ppid=,pgid=,uid=,stat=,command= > /dev/null 2> "$evidence_dir/
   exit 3
 fi
 npx -y rea-agents@6.7.0 --version > "$evidence_dir/rea-version.txt"
-npx -y rea-agents@6.7.0 analyze-javascript-application "$target_dir" --json > "$evidence_dir/analysis.json" 2> "$evidence_dir/progress.log"
+npx -y rea-agents@6.7.0 analyze-javascript-application "$target_dir" --max-heap-mb 4096 --analysis-timeout-ms 300000 --json > "$evidence_dir/analysis.json" 2> "$evidence_dir/progress.log"
 echo "REA evidence: $evidence_dir/analysis.json"
